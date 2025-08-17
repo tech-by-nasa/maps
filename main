@@ -1,0 +1,1048 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UNIT Prototype</title>
+    <!-- Leaflet JS and CSS for OpenStreetMap, which does not require a token. -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha2d512-SzTEwL2+i9f9F+991/c/lJd49z8n4O4/JbQ2/w6lXbO/0z9C/2p8A5E+4L5L/hB4C" crossorigin="" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha2d512-i5y6S6Vv2gYh8sH9B4/C5Zt6jJ7F7B0z3uL9z8Y8R4u9B2y6O8S6h7j7G5h7k6B2e5F6K4O8L2d5V8p8T7C+z8Z3L9d8n+w8U2i9b9Y9F4Q5/x6gB4J8C+j+k6C+l0h5L/L1w/2v2x2v" crossorigin=""></script>
+    <!-- React and ReactDOM are loaded from a CDN to run the app in a single HTML file. -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <!-- Babel is used to transform JSX into plain JavaScript in the browser. -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Tailwind CSS is loaded from a CDN for styling. -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* This CSS ensures the map fills the full screen. */
+        body, html, #root, #map {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            font-family: ui-sans-serif, system-ui, sans-serif;
+        }
+
+        /* Custom scrollbar for the controls panel */
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 8px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: #f1f5f9; /* slate-100 */
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background-color: #cbd5e1; /* slate-300 */
+            border-radius: 4px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+            background-color: #94a3b8; /* slate-400 */
+        }
+
+        /* Drowsiness alert animation */
+        .drowsiness-pulse {
+            animation: pulse-red 1s infinite;
+        }
+
+        @keyframes pulse-red {
+            0%, 100% {
+                background-color: rgba(239, 68, 68, 0.4); /* red-500 with opacity */
+            }
+            50% {
+                background-color: rgba(239, 68, 68, 0.8); /* red-500 with higher opacity */
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- The root element where our React application will be mounted. -->
+    <div id="root"></div>
+
+    <script type="text/babel">
+        // Helper functions for TTS audio conversion
+        function base64ToArrayBuffer(base64) {
+            const binaryString = window.atob(base64);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            return bytes.buffer;
+        }
+
+        function pcmToWav(pcm16, sampleRate) {
+            const numSamples = pcm16.length;
+            const numChannels = 1;
+            const sampleRateHz = sampleRate;
+            const bitDepth = 16;
+            const format = 1; // PCM
+            const byteRate = sampleRateHz * numChannels * bitDepth / 8;
+            const blockAlign = numChannels * bitDepth / 8;
+            const dataSize = numSamples * numChannels * bitDepth / 8;
+
+            const buffer = new ArrayBuffer(44 + dataSize);
+            const view = new DataView(buffer);
+
+            // RIFF header
+            writeString(view, 0, 'RIFF');
+            view.setUint32(4, 36 + dataSize, true);
+            writeString(view, 8, 'WAVE');
+
+            // fmt chunk
+            writeString(view, 12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, format, true);
+            view.setUint16(22, numChannels, true);
+            view.setUint32(24, sampleRateHz, true);
+            view.setUint32(28, byteRate, true);
+            view.setUint16(32, blockAlign, true);
+            view.setUint16(34, bitDepth, true);
+
+            // data chunk
+            writeString(view, 36, 'data');
+            view.setUint32(40, dataSize, true);
+            let offset = 44;
+            for (let i = 0; i < numSamples; i++) {
+                view.setInt16(offset, pcm16[i], true);
+                offset += 2;
+            }
+
+            return new Blob([view], { type: 'audio/wav' });
+        }
+
+        function writeString(view, offset, string) {
+            for (let i = 0; i < string.length; i++) {
+                view.setUint8(offset + i, string.charCodeAt(i));
+            }
+        }
+
+        // The main React App component.
+        function App() {
+            const mapContainer = React.useRef(null);
+            const map = React.useRef(null);
+            const osmTileLayer = React.useRef(null);
+            const satelliteTileLayer = React.useRef(null);
+            const routePolyline = React.useRef(null);
+            const startMarker = React.useRef(null);
+            const endMarker = React.useRef(null);
+            const audioRef = React.useRef(null);
+
+            // Initial coordinates for the map view (Berlin).
+            const [lng, setLng] = React.useState(13.405);
+            const [lat, setLat] = React.useState(52.52);
+            const [zoom, setZoom] = React.useState(13);
+            const [isAlertActive, setIsAlertActive] = React.useState(false);
+            const [alertMessage, setAlertMessage] = React.useState('');
+            const [simulatedObjects, setSimulatedObjects] = React.useState([]);
+            const [drowsinessAlert, setDrowsinessAlert] = React.useState(false);
+            const [showEvStations, setShowEvStations] = React.useState(false);
+            const [showParking, setShowParking] = React.useState(false);
+            const [showBikes, setShowBikes] = React.useState(false);
+            const [evStationMarkers, setEvStationMarkers] = React.useState([]);
+            const [parkingMarkers, setParkingMarkers] = React.useState([]);
+            const [bikeMarkers, setBikeMarkers] = React.useState([]);
+            const [searchQuery, setSearchQuery] = React.useState('');
+            const [isDrowsinessDetectionEnabled, setIsDrowsinessDetectionEnabled] = React.useState(false);
+            const [isDriving, setIsDriving] = React.useState(false);
+            const [currentView, setCurrentView] = React.useState('normal');
+            const [startPoint, setStartPoint] = React.useState('');
+            const [endPoint, setEndPoint] = React.useState('');
+            const [searchResults, setSearchResults] = React.useState([]);
+            const [isControlsVisible, setIsControlsVisible] = React.useState(true);
+            const [avoidTolls, setAvoidTolls] = React.useState(false);
+            const [avoidFerries, setAvoidFerries] = React.useState(false);
+            const [preferScenic, setPreferScenic] = React.useState(false);
+            const [isLoading, setIsLoading] = React.useState(false);
+            const [evStationList, setEvStationList] = React.useState([]);
+            const [isTeslaViewEnabled, setIsTeslaViewEnabled] = React.useState(false);
+            const [teslaViewObjects, setTeslaViewObjects] = React.useState([]);
+
+            const userCarMarkerRef = React.useRef(null);
+            const videoRef = React.useRef(null);
+
+            // Initialize the map and tile layers on the first render.
+            React.useEffect(() => {
+                if (map.current) return;
+
+                if (typeof L === 'undefined') {
+                    console.error("Leaflet JS is not loaded. Check the CDN link.");
+                    setAlertMessage("Leaflet JS is not loaded. The app will not function correctly.");
+                    setIsAlertActive(true);
+                    return;
+                }
+
+                // Remove default Leaflet zoom controls to add our own.
+                map.current = L.map(mapContainer.current, { zoomControl: false }).setView([lat, lng], zoom);
+
+                // Create the two tile layers but only add the OSM one initially.
+                osmTileLayer.current = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                }).addTo(map.current);
+
+                satelliteTileLayer.current = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+                    attribution: 'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community'
+                });
+            
+                userCarMarkerRef.current = L.circleMarker([lat, lng], {
+                    color: '#34d399',
+                    fillColor: '#34d399',
+                    fillOpacity: 1,
+                    radius: 8
+                }).addTo(map.current);
+                
+                userCarMarkerRef.current.bindPopup('<h1>Your Car</h1>').openPopup();
+
+                return () => {
+                    if (map.current) {
+                        map.current.remove();
+                    }
+                };
+            }, []);
+            
+            // New: Interval for voice directions while driving.
+            React.useEffect(() => {
+                let intervalId;
+                if (isDriving) {
+                    intervalId = setInterval(() => {
+                        sayDirection();
+                    }, 15000); // Trigger every 15 seconds
+                }
+                return () => clearInterval(intervalId);
+            }, [isDriving]);
+
+            // Function to handle zoom controls
+            const handleZoom = (level) => {
+                if (map.current) {
+                    if (level === '+') {
+                        map.current.zoomIn();
+                    } else if (level === '-') {
+                        map.current.zoomOut();
+                    }
+                }
+            };
+
+            // Handle user movement simulation.
+            React.useEffect(() => {
+                let intervalId;
+            
+                const moveCar = () => {
+                    setLng(prevLng => prevLng + 0.0001);
+                    setLat(prevLat => prevLat + 0.00005);
+                };
+            
+                if (isDriving) {
+                    intervalId = setInterval(moveCar, 100);
+                }
+            
+                if (userCarMarkerRef.current && map.current) {
+                    userCarMarkerRef.current.setLatLng([lat, lng]);
+                    map.current.panTo([lat, lng]);
+                }
+            
+                return () => clearInterval(intervalId);
+            }, [isDriving, lng, lat]);
+
+            // Function to change the map's tile layer.
+            const changeMapView = (view) => {
+                if (!map.current) return;
+
+                if (view === 'normal') {
+                    if (map.current.hasLayer(satelliteTileLayer.current)) {
+                        map.current.removeLayer(satelliteTileLayer.current);
+                    }
+                    if (!map.current.hasLayer(osmTileLayer.current)) {
+                        map.current.addLayer(osmTileLayer.current);
+                    }
+                    setCurrentView('normal');
+                } else if (view === 'satellite') {
+                    if (map.current.hasLayer(osmTileLayer.current)) {
+                        map.current.removeLayer(osmTileLayer.current);
+                    }
+                    if (!map.current.hasLayer(satelliteTileLayer.current)) {
+                        map.current.addLayer(satelliteTileLayer.current);
+                    }
+                    setCurrentView('satellite');
+                } else if (view === '3d') {
+                    setAlertMessage("3D view is not a standard feature of 2D map libraries like this. A completely different application architecture with a 3D rendering engine would be needed.");
+                    setIsAlertActive(true);
+                }
+            };
+            
+            // Function to get a predictive hazard alert from Gemini LLM
+            const getPredictiveAlert = async () => {
+                setIsLoading(true);
+                setAlertMessage("Generating predictive alert...");
+                setIsAlertActive(true);
+
+                const prompt = `Based on the current conditions, generate a detailed and professional predictive hazard alert for a driver. Include the type of hazard, a short description, and a clear safety recommendation. The conditions are: light rain, rush hour traffic, and a recent history of minor fender-benders in the area. Respond with a single, concise paragraph.`;
+                
+                let chatHistory = [];
+                chatHistory.push({ role: "user", parts: [{ text: prompt }] });
+                const payload = { contents: chatHistory };
+                const apiKey = "";
+                const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+
+                try {
+                    const response = await fetch(apiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`API Error: ${response.statusText}`);
+                    }
+
+                    const result = await response.json();
+                    const generatedText = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+                    if (generatedText) {
+                        setAlertMessage(`PREDICTIVE ALERT: ${generatedText}`);
+                    } else {
+                        setAlertMessage("PREDICTIVE ALERT: Unable to generate a specific alert. Proceed with caution.");
+                    }
+                } catch (error) {
+                    console.error("Gemini API call failed:", error);
+                    setAlertMessage("Error getting predictive alert. Please try again.");
+                } finally {
+                    setIsAlertActive(true);
+                    setIsLoading(false);
+                }
+            };
+
+            const simulateHazard = () => {
+                if (!map.current) return;
+                const hazardLng = lng + (Math.random() - 0.5) * 0.005;
+                const hazardLat = lat + (Math.random() - 0.5) * 0.005;
+                const el = document.createElement('div');
+                el.innerHTML = '<span class="text-3xl animate-pulse">⚠️</span>';
+                L.marker([hazardLat, hazardLng], {
+                    icon: L.divIcon({
+                        className: '',
+                        html: el.innerHTML,
+                        iconSize: [24, 24],
+                        iconAnchor: [12, 24]
+                    })
+                }).addTo(map.current).bindPopup('Road Debris Ahead!');
+                setAlertMessage("ALERT: Road Debris Reported Ahead!");
+                setIsAlertActive(true);
+            };
+            
+            const triggerDrowsinessAlert = () => {
+                setAlertMessage("WARNING: Signs of Drowsy Driving Detected. Take a break!");
+                setDrowsinessAlert(true);
+                setIsAlertActive(true);
+            };
+            
+            // Updated function to simulate a wider variety of urban life objects.
+            const simulateUrbanLife = () => {
+                // Clear any existing simulated objects first
+                const existingMarkers = document.querySelectorAll('.leaflet-marker-pane .simulated-object');
+                existingMarkers.forEach(marker => marker.remove());
+                
+                const objectTypes = ['car', 'car', 'car', 'pedestrian', 'pedestrian', 'cycle', 'dog', 'heavy_vehicle'];
+                const newObjects = Array.from({ length: 20 }).map(() => {
+                    // Generate coordinates randomly within a larger radius for a more distributed feel
+                    const type = objectTypes[Math.floor(Math.random() * objectTypes.length)];
+                    const distanceScale = 0.008; // Increase radius for more spread out objects
+                    const objLng = lng + (Math.random() - 0.5) * distanceScale;
+                    const objLat = lat + (Math.random() - 0.5) * distanceScale;
+                    return { lng: objLng, lat: objLat, type: type, id: Math.random() };
+                });
+                setSimulatedObjects(newObjects);
+            };
+
+            // New: Function to get EV station data from Gemini LLM using a structured response
+            const findEvStations = async () => {
+                setIsLoading(true);
+                setAlertMessage("Finding EV stations...");
+                setIsAlertActive(true);
+                
+                // Prompt for Gemini to generate structured JSON data
+                const prompt = `Generate a JSON array of 3 realistic but fictitious EV charging stations near a central location. For each station, include the following properties: "name" (a string), "address" (a string), "availability" (a string like 'available', 'busy', or 'out of service'), and "pricePerKWH" (a number).`;
+                
+                let chatHistory = [];
+                chatHistory.push({ role: "user", parts: [{ text: prompt }] });
+                const payload = {
+                    contents: chatHistory,
+                    generationConfig: {
+                        responseMimeType: "application/json",
+                        responseSchema: {
+                            type: "ARRAY",
+                            items: {
+                                type: "OBJECT",
+                                properties: {
+                                    "name": { "type": "STRING" },
+                                    "address": { "type": "STRING" },
+                                    "availability": { "type": "STRING" },
+                                    "pricePerKWH": { "type": "NUMBER" }
+                                },
+                                "propertyOrdering": ["name", "address", "availability", "pricePerKWH"]
+                            }
+                        }
+                    }
+                };
+                
+                const apiKey = "";
+                const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+
+                try {
+                    const response = await fetch(apiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`API Error: ${response.statusText}`);
+                    }
+
+                    const result = await response.json();
+                    const generatedJson = result?.candidates?.[0]?.content?.parts?.[0]?.text;
+                    
+                    if (generatedJson) {
+                        const parsedData = JSON.parse(generatedJson);
+                        setEvStationList(parsedData);
+                        setAlertMessage("EV station data generated. See the list and map markers.");
+                        // Simulate showing markers based on the generated data
+                        setShowEvStations(true);
+                        // In a real app, you would use geocoding to get lat/lng from address.
+                        // Here, we'll use mock coordinates relative to the current position.
+                        const mockCoords = [
+                            [lat + 0.002, lng - 0.001],
+                            [lat - 0.003, lng + 0.002],
+                            [lat + 0.005, lng + 0.004]
+                        ];
+                        const newMarkers = parsedData.map((station, index) => {
+                            const el = document.createElement('div');
+                            el.innerHTML = '<span class="text-3xl">🔌</span>';
+                            const newMarker = L.marker(mockCoords[index], { icon: L.divIcon({ className: '', html: el.innerHTML, iconSize: [30, 30], iconAnchor: [15, 30] }) }).addTo(map.current);
+                            newMarker.bindPopup(`<b>${station.name}</b><br>${station.address}<br>Availability: ${station.availability}<br>Price: £${station.pricePerKWH}/kWh`);
+                            return newMarker;
+                        });
+                        setEvStationMarkers(newMarkers);
+
+                    } else {
+                        setEvStationList([]);
+                        setAlertMessage("Could not generate EV station data.");
+                    }
+                } catch (error) {
+                    console.error("Gemini API structured call failed:", error);
+                    setAlertMessage("Error finding EV stations. Please try again.");
+                } finally {
+                    setIsLoading(false);
+                    setIsAlertActive(true);
+                }
+            };
+
+            const toggleEvStations = () => { 
+                if (showEvStations) {
+                    evStationMarkers.forEach(marker => map.current.removeLayer(marker));
+                    setEvStationMarkers([]);
+                    setEvStationList([]);
+                    setShowEvStations(false);
+                } else {
+                    findEvStations();
+                }
+            };
+            
+            const toggleParking = () => { setShowParking(prev => !prev); };
+            React.useEffect(() => {
+                parkingMarkers.forEach(marker => map.current.removeLayer(marker));
+                setParkingMarkers([]);
+                if (showParking) {
+                    const newMarkers = [
+                        [lat + 0.001, lng - 0.003], [lat - 0.004, lng - 0.002]
+                    ].map(coords => {
+                        const el = document.createElement('div');
+                        el.innerHTML = '<span class="text-3xl">🅿️</span>';
+                        const newMarker = L.marker(coords, { icon: L.divIcon({ className: '', html: el.innerHTML, iconSize: [30, 30], iconAnchor: [15, 30] }) }).addTo(map.current);
+                        return newMarker;
+                    });
+                    setParkingMarkers(newMarkers);
+                }
+            }, [showParking, lat, lng]);
+
+            const toggleBikes = () => { setShowBikes(prev => !prev); };
+            React.useEffect(() => {
+                bikeMarkers.forEach(marker => map.current.removeLayer(marker));
+                setBikeMarkers([]);
+                if (showBikes) {
+                    const newMarkers = [
+                        [lat + 0.002, lng - 0.002], [lat + 0.003, lng - 0.001], [lat - 0.001, lng + 0.001]
+                    ].map(coords => {
+                        const el = document.createElement('div');
+                        el.innerHTML = '<span class="text-3xl">🚲</span>';
+                        const newMarker = L.marker(coords, { icon: L.divIcon({ className: '', html: el.innerHTML, iconSize: [30, 30], iconAnchor: [15, 30] }) }).addTo(map.current);
+                        return newMarker;
+                    });
+                    setBikeMarkers(newMarkers);
+                }
+            }, [showBikes, lat, lng]);
+            
+            React.useEffect(() => {
+                if (!map.current) return;
+                const markersToRemove = document.querySelectorAll('.leaflet-marker-pane .simulated-object');
+                markersToRemove.forEach(marker => marker.remove());
+
+                simulatedObjects.forEach(obj => {
+                    let iconHtml;
+                    let iconSize = [20, 20];
+                    let iconAnchor = [10, 10];
+                    if (obj.type === 'car') {
+                        iconHtml = '<span class="w-4 h-4 rounded-full bg-white border border-gray-400 block"></span>';
+                    } else if (obj.type === 'pedestrian') {
+                        iconHtml = '<span class="text-xl">🚶‍♂️</span>';
+                        iconSize = [24, 24];
+                        iconAnchor = [12, 12];
+                    } else if (obj.type === 'cycle') {
+                        iconHtml = '<span class="text-xl">🚴‍♀️</span>';
+                        iconSize = [24, 24];
+                        iconAnchor = [12, 12];
+                    } else if (obj.type === 'dog') {
+                        iconHtml = '<span class="text-xl">🐕</span>';
+                        iconSize = [24, 24];
+                        iconAnchor = [12, 12];
+                    } else if (obj.type === 'heavy_vehicle') {
+                        iconHtml = '<span class="text-xl">🚚</span>';
+                        iconSize = [30, 30];
+                        iconAnchor = [15, 15];
+                    }
+                    L.marker([obj.lat, obj.lng], {
+                        icon: L.divIcon({
+                            className: 'simulated-object', // Add class for easy removal
+                            html: iconHtml,
+                            iconSize: iconSize,
+                            iconAnchor: iconAnchor
+                        })
+                    }).addTo(map.current);
+                });
+            }, [simulatedObjects, map]);
+            
+            // New: Update the Tesla view objects based on the main simulation
+            React.useEffect(() => {
+                if (!isTeslaViewEnabled) return;
+                const newTeslaObjects = simulatedObjects.map(obj => {
+                    // This is a simple mock translation from map coordinates to screen coordinates
+                    // In a real system, this would be a complex projection
+                    const y = (obj.lat - lat) * -50000; // Invert and scale
+                    const x = (obj.lng - lng) * 50000; // Scale
+                    const distance = Math.sqrt(x*x + y*y);
+                    const scale = 1 - (distance / 500); // Scale down based on distance
+                    return { ...obj, x, y, scale: Math.max(0.2, scale) };
+                }).filter(obj => obj.y > -50 && obj.y < 500); // Only show objects within view
+                setTeslaViewObjects(newTeslaObjects);
+            }, [simulatedObjects, isTeslaViewEnabled, lat, lng]);
+
+            const handleAlertClose = () => {
+                setIsAlertActive(false);
+                setAlertMessage('');
+                setDrowsinessAlert(false);
+            };
+            
+            // Simulated search function that returns mock data.
+            const handleLiveSearch = (query) => {
+                const lowerQuery = query.toLowerCase();
+                if (lowerQuery.length < 2) {
+                    setSearchResults([]);
+                    return;
+                }
+                // Mock search results for different query types
+                const mockResults = [];
+                if (lowerQuery.includes('coffee')) {
+                    mockResults.push({ name: 'Central Perk Coffee', distance: '0.5 mi', coords: [lat + 0.001, lng + 0.001] });
+                    mockResults.push({ name: 'Morning Brew', distance: '1.2 mi', coords: [lat - 0.002, lng + 0.003] });
+                    mockResults.push({ name: 'Urban Grind', distance: '2.5 mi', coords: [lat + 0.004, lng - 0.001] });
+                }
+                if (lowerQuery.includes('gas') || lowerQuery.includes('fuel')) {
+                    mockResults.push({ name: 'QuickFill Station', distance: '0.8 mi', coords: [lat + 0.001, lng - 0.002] });
+                    mockResults.push({ name: 'EcoFuel Stop', distance: '1.5 mi', coords: [lat - 0.001, lng + 0.001] });
+                }
+                if (lowerQuery.includes('restaurant')) {
+                     mockResults.push({ name: 'The Fancy Fork', distance: '0.6 mi', coords: [lat + 0.001, lng - 0.001] });
+                     mockResults.push({ name: 'Grill House', distance: '1.8 mi', coords: [lat - 0.003, lng + 0.002] });
+                }
+                setSearchResults(mockResults);
+            };
+
+            // New: Speak function using the Gemini TTS API
+            const speak = async (text) => {
+                if (audioRef.current) {
+                    audioRef.current.pause();
+                    audioRef.current.currentTime = 0;
+                }
+                
+                try {
+                    const payload = {
+                        contents: [{
+                            parts: [{ text: text }]
+                        }],
+                        generationConfig: {
+                            responseModalities: ["AUDIO"],
+                            speechConfig: {
+                                voiceConfig: {
+                                    prebuiltVoiceConfig: { voiceName: "Zephyr" }
+                                }
+                            }
+                        },
+                        model: "gemini-2.5-flash-preview-tts"
+                    };
+                    const apiKey = "";
+                    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`;
+                    
+                    const response = await fetch(apiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                    
+                    if (!response.ok) {
+                        const errorData = await response.json();
+                        throw new Error(`API Error: ${response.statusText} - ${errorData.message}`);
+                    }
+                    
+                    const result = await response.json();
+                    const part = result?.candidates?.[0]?.content?.parts?.[0];
+                    const audioData = part?.inlineData?.data;
+                    const mimeType = part?.inlineData?.mimeType;
+
+                    if (audioData && mimeType && mimeType.startsWith("audio/")) {
+                        const sampleRate = 16000; // API returns 16kHz PCM
+                        const pcmData = base64ToArrayBuffer(audioData);
+                        const pcm16 = new Int16Array(pcmData);
+                        const wavBlob = pcmToWav(pcm16, sampleRate);
+                        const audioUrl = URL.createObjectURL(wavBlob);
+                        
+                        audioRef.current.src = audioUrl;
+                        audioRef.current.play();
+                    } else {
+                        throw new Error('Invalid audio data from API');
+                    }
+                } catch (error) {
+                    console.error("TTS failed:", error);
+                    // Fallback to text alert on error
+                    setAlertMessage(`TTS failed: ${error.message}`);
+                    setIsAlertActive(true);
+                }
+            };
+            
+            // Function to simulate a direction announcement
+            const sayDirection = () => {
+                const directions = [
+                    "In two hundred feet, turn right onto Main Street.",
+                    "Continue straight for three miles.",
+                    "Take the next exit on the left.",
+                    "You have arrived at your destination. The destination is on your right.",
+                    "Rerouting... Turn left at the next intersection.",
+                ];
+                const randomDirection = directions[Math.floor(Math.random() * directions.length)];
+                setAlertMessage(`Voice: "${randomDirection}"`);
+                setIsAlertActive(true);
+                speak(randomDirection);
+            };
+
+            // Simulated function to draw a route on the map.
+            const getRoute = () => {
+                if (!startPoint || !endPoint) {
+                    setAlertMessage("Please enter a start and end location to get a route.");
+                    setIsAlertActive(true);
+                    return;
+                }
+                setIsDriving(false);
+                // Remove previous route and markers
+                if (routePolyline.current) map.current.removeLayer(routePolyline.current);
+                if (startMarker.current) map.current.removeLayer(startMarker.current);
+                if (endMarker.current) map.current.removeLayer(endMarker.current);
+
+                // Mock coordinates for a route based on start/end points.
+                let mockRoute;
+                if (preferScenic) {
+                    mockRoute = [
+                        [lat, lng],
+                        [lat + 0.002, lng + 0.005],
+                        [lat + 0.008, lng + 0.007],
+                        [lat + 0.012, lng + 0.002],
+                        [lat + 0.015, lng + 0.006]
+                    ];
+                } else {
+                    mockRoute = [
+                        [lat, lng],
+                        [lat + 0.002, lng + 0.001],
+                        [lat + 0.004, lng + 0.003],
+                        [lat + 0.005, lng + 0.002]
+                    ];
+                }
+                
+                // Add new route polyline.
+                routePolyline.current = L.polyline(mockRoute, {
+                    color: '#f97316',
+                    weight: 5,
+                    opacity: 0.8
+                }).addTo(map.current);
+                
+                // Add new start and end markers.
+                startMarker.current = L.marker(mockRoute[0], { icon: L.divIcon({ html: '<span class="text-3xl text-green-500">A</span>', className: '', iconSize: [20, 20] }) }).addTo(map.current);
+                endMarker.current = L.marker(mockRoute[mockRoute.length - 1], { icon: L.divIcon({ html: '<span class="text-3xl text-red-500">B</span>', className: '', iconSize: [20, 20] }) }).addTo(map.current);
+
+                map.current.fitBounds(routePolyline.current.getBounds());
+                setAlertMessage("Simulated route generated.");
+                setIsAlertActive(true);
+
+                // Announce the first direction
+                sayDirection();
+            };
+
+            const enableDrowsinessDetection = async () => {
+                setIsDrowsinessDetectionEnabled(true);
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+                    if (videoRef.current) {
+                        videoRef.current.srcObject = stream;
+                    }
+                    setTimeout(() => { triggerDrowsinessAlert(); }, 5000);
+                } catch (err) {
+                    console.error("Error accessing camera: ", err);
+                    setAlertMessage("Could not access camera. Please allow camera permissions and ensure you are on a secure server (HTTPS).");
+                    setIsAlertActive(true);
+                    setIsDrowsinessDetectionEnabled(false);
+                }
+            };
+
+            const stopDrowsinessDetection = () => {
+                setIsDrowsinessDetectionEnabled(false);
+                if (videoRef.current && videoRef.current.srcObject) {
+                    const tracks = videoRef.current.srcObject.getTracks();
+                    tracks.forEach(track => track.stop());
+                }
+                setDrowsinessAlert(false);
+            };
+
+            return (
+                <div className="relative w-screen h-screen">
+                    {/* Audio element for TTS playback */}
+                    <audio ref={audioRef} className="hidden"></audio>
+                    
+                    {/* Map container */}
+                    <div ref={mapContainer} id="map" className={`w-full h-full ${isTeslaViewEnabled ? 'hidden' : 'block'}`} />
+                    
+                    {/* Tesla-style driver's view simulation */}
+                    {isTeslaViewEnabled && (
+                        <div className="absolute inset-0 bg-gray-950 flex flex-col justify-end items-center z-[1000] p-4 overflow-hidden">
+                            {/* Road background with moving lines */}
+                            <div className="absolute inset-0 z-10 overflow-hidden">
+                                <div className="absolute top-0 bottom-0 left-1/2 -translate-x-1/2 w-4 bg-gray-700 rounded-full" style={{ transform: 'translateX(-50%) perspective(400px) scale(0.5, 1) rotateX(45deg)'}}></div>
+                                <div className="absolute top-0 bottom-0 left-1/2 -translate-x-1/2 w-1 h-full bg-yellow-400" style={{ transform: 'translateX(-50%) perspective(400px) scale(0.5, 1) rotateX(45deg)'}}></div>
+                            </div>
+
+                            {/* Simulated objects moving towards the user */}
+                            {teslaViewObjects.map(obj => (
+                                <div
+                                    key={obj.id}
+                                    className="absolute transform transition-transform duration-100"
+                                    style={{
+                                        left: `calc(50% + ${obj.x}px)`,
+                                        bottom: `${obj.y * 1.5}px`, // Increased multiplier for more dramatic movement
+                                        fontSize: `${10 * obj.scale}rem`,
+                                        opacity: obj.scale > 0.5 ? 1 : 0.5,
+                                        transform: `scale(${obj.scale}) translateX(-50%) translateY(50%)`
+                                    }}
+                                >
+                                    {obj.type === 'car' && <span className="text-white">🚗</span>}
+                                    {obj.type === 'pedestrian' && <span className="text-white">🚶‍♂️</span>}
+                                    {obj.type === 'cycle' && <span className="text-white">🚴‍♀️</span>}
+                                    {obj.type === 'dog' && <span className="text-white">🐕</span>}
+                                    {obj.type === 'heavy_vehicle' && <span className="text-white">🚚</span>}
+                                </div>
+                            ))}
+
+                            {/* User's car icon at the bottom of the screen */}
+                            <div className="relative z-20 mb-8">
+                                <span className="text-6xl text-green-400">🚗</span>
+                            </div>
+                        </div>
+                    )}
+            
+                    {/* Left-hand side controls column */}
+                    <div className={`absolute top-0 left-0 h-full w-72 bg-gray-900 bg-opacity-90 p-6 flex flex-col space-y-4 shadow-xl text-white z-[1001] custom-scrollbar overflow-y-auto transform transition-transform duration-300 ${isControlsVisible ? 'translate-x-0' : '-translate-x-full'}`}>
+                        <h2 className="text-2xl font-bold mb-2 text-center text-gray-100">UNIT Controls</h2>
+                        
+                        {/* Map View Section */}
+                        <div className="space-y-2">
+                            <h3 className="text-lg font-semibold text-gray-200">Map View</h3>
+                            <div className="flex space-x-2">
+                                <button
+                                    onClick={() => changeMapView('normal')}
+                                    className={`flex-1 py-2 px-4 rounded-lg font-semibold transition-colors ${currentView === 'normal' ? 'bg-blue-500 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}
+                                >
+                                    Normal
+                                </button>
+                                <button
+                                    onClick={() => changeMapView('satellite')}
+                                    className={`flex-1 py-2 px-4 rounded-lg font-semibold transition-colors ${currentView === 'satellite' ? 'bg-blue-500 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}
+                                >
+                                    Satellite
+                                </button>
+                                <button
+                                    onClick={() => changeMapView('3d')}
+                                    className={`flex-1 py-2 px-4 rounded-lg font-semibold transition-colors ${currentView === '3d' ? 'bg-blue-500 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}
+                                >
+                                    3D
+                                </button>
+                            </div>
+                            <button
+                                onClick={() => setIsTeslaViewEnabled(!isTeslaViewEnabled)}
+                                className="w-full bg-purple-500 text-white font-semibold py-2 px-4 rounded-lg hover:bg-purple-600 transition-colors"
+                            >
+                                {isTeslaViewEnabled ? 'Show Map View' : 'Show Driver\'s View'}
+                            </button>
+                        </div>
+
+                        {/* Search and Routing Section */}
+                        <div className="space-y-2">
+                            <h3 className="text-lg font-semibold text-gray-200">Search & Route</h3>
+                            <input
+                                type="text"
+                                value={searchQuery}
+                                onChange={(e) => {
+                                    setSearchQuery(e.target.value);
+                                    handleLiveSearch(e.target.value);
+                                }}
+                                placeholder="Search for a place (e.g. coffee shop)..."
+                                className="w-full p-2 rounded-lg bg-gray-700 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            />
+                            {searchResults.length > 0 && (
+                                <ul className="bg-gray-800 rounded-lg shadow-md max-h-40 overflow-y-auto custom-scrollbar">
+                                    {searchResults.map((result, index) => (
+                                        <li key={index} className="p-2 border-b border-gray-700 last:border-0 hover:bg-gray-700 cursor-pointer">
+                                            <div className="text-sm font-medium">{result.name}</div>
+                                            <div className="text-xs text-gray-400">{result.distance} away</div>
+                                        </li>
+                                    ))}
+                                </ul>
+                            )}
+                            <input
+                                type="text"
+                                value={startPoint}
+                                onChange={(e) => setStartPoint(e.target.value)}
+                                placeholder="Start Point"
+                                className="w-full p-2 rounded-lg bg-gray-700 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            />
+                            <input
+                                type="text"
+                                value={endPoint}
+                                onChange={(e) => setEndPoint(e.target.value)}
+                                placeholder="End Point"
+                                className="w-full p-2 rounded-lg bg-gray-700 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                            />
+                            <button
+                                onClick={getRoute}
+                                className="w-full bg-blue-500 text-white font-semibold py-2 px-4 rounded-lg hover:bg-blue-600 transition-colors"
+                            >
+                                Get Route
+                            </button>
+                        </div>
+                        
+                        {/* Route Preferences Section */}
+                        <div className="space-y-2">
+                            <h3 className="text-lg font-semibold text-gray-200">Route Preferences</h3>
+                            <div className="flex items-center space-x-2">
+                                <input type="checkbox" id="avoidTolls" checked={avoidTolls} onChange={() => setAvoidTolls(!avoidTolls)} className="form-checkbox h-5 w-5 text-blue-500 rounded border-gray-600 bg-gray-700" />
+                                <label htmlFor="avoidTolls" className="text-sm">Avoid Tolls</label>
+                            </div>
+                            <div className="flex items-center space-x-2">
+                                <input type="checkbox" id="avoidFerries" checked={avoidFerries} onChange={() => setAvoidFerries(!avoidFerries)} className="form-checkbox h-5 w-5 text-blue-500 rounded border-gray-600 bg-gray-700" />
+                                <label htmlFor="avoidFerries" className="text-sm">Avoid Ferries</label>
+                            </div>
+                            <div className="flex items-center space-x-2">
+                                <input type="checkbox" id="preferScenic" checked={preferScenic} onChange={() => setPreferScenic(!preferScenic)} className="form-checkbox h-5 w-5 text-blue-500 rounded border-gray-600 bg-gray-700" />
+                                <label htmlFor="preferScenic" className="text-sm">Prefer Scenic Route</label>
+                            </div>
+                        </div>
+
+                        {/* General Controls Section */}
+                        <div className="space-y-2">
+                            <h3 className="text-lg font-semibold text-gray-200">Vehicle & Safety</h3>
+                            <button
+                                onClick={() => setIsDriving(!isDriving)}
+                                className={`w-full font-semibold py-2 px-4 rounded-lg transition-colors ${isDriving ? 'bg-red-500 text-white' : 'bg-green-500 text-white'}`}
+                            >
+                                {isDriving ? 'Stop Drive' : 'Start Drive'}
+                            </button>
+                            <button
+                                onClick={simulateHazard}
+                                className="w-full bg-yellow-400 text-gray-900 font-semibold py-2 px-4 rounded-lg hover:bg-yellow-500 transition-colors"
+                            >
+                                Report Hazard
+                            </button>
+                            {/* New Gemini LLM-powered button for predictive alerts */}
+                            <button
+                                onClick={getPredictiveAlert}
+                                disabled={isLoading}
+                                className="w-full bg-orange-400 text-gray-900 font-semibold py-2 px-4 rounded-lg hover:bg-orange-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                                Get Predictive Alert ✨
+                            </button>
+                            {!isDrowsinessDetectionEnabled ? (
+                                <button
+                                    onClick={enableDrowsinessDetection}
+                                    className="w-full bg-red-500 text-white font-semibold py-2 px-4 rounded-lg hover:bg-red-600 transition-colors"
+                                >
+                                    Enable Drowsiness
+                                </button>
+                            ) : (
+                                <button
+                                    onClick={stopDrowsinessDetection}
+                                    className="w-full bg-gray-500 text-white font-semibold py-2 px-4 rounded-lg hover:bg-gray-600 transition-colors"
+                                >
+                                    Stop Drowsiness
+                                </button>
+                            )}
+                            <button
+                                onClick={simulateUrbanLife}
+                                className="w-full bg-blue-500 text-white font-semibold py-2 px-4 rounded-lg hover:bg-blue-600 transition-colors"
+                            >
+                                Simulate Urban Life
+                            </button>
+                        </div>
+
+                        {/* Filter Layers Section */}
+                        <div className="space-y-2">
+                            <h3 className="text-lg font-semibold text-gray-200">Filter Layers</h3>
+                            {/* New Gemini LLM-powered button for EV stations */}
+                            <button
+                                onClick={toggleEvStations}
+                                disabled={isLoading}
+                                className={`w-full font-semibold py-2 px-4 rounded-lg transition-colors ${showEvStations ? 'bg-green-500 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'} disabled:opacity-50 disabled:cursor-not-allowed`}
+                            >
+                                {showEvStations ? 'Hide EV Stations' : 'Find EV Stations ✨'}
+                            </button>
+                            {evStationList.length > 0 && (
+                                <ul className="bg-gray-800 rounded-lg shadow-md max-h-40 overflow-y-auto custom-scrollbar p-2">
+                                    <h4 className="font-semibold text-gray-300 mb-2">Nearby Stations:</h4>
+                                    {evStationList.map((station, index) => (
+                                        <li key={index} className="p-2 border-b border-gray-700 last:border-0">
+                                            <div className="text-sm font-medium text-blue-300">{station.name}</div>
+                                            <div className="text-xs text-gray-400">{station.address}</div>
+                                            <div className="text-xs text-gray-400">Status: {station.availability}</div>
+                                            <div className="text-xs text-gray-400">Price: £{station.pricePerKWH}/kWh</div>
+                                        </li>
+                                    ))}
+                                </ul>
+                            )}
+                            <button
+                                onClick={toggleParking}
+                                className={`w-full font-semibold py-2 px-4 rounded-lg transition-colors ${showParking ? 'bg-green-500 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}
+                            >
+                                {showParking ? 'Hide Parking' : 'Show Parking'}
+                            </button>
+                            <button
+                                onClick={toggleBikes}
+                                className={`w-full font-semibold py-2 px-4 rounded-lg transition-colors ${showBikes ? 'bg-green-500 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'}`}
+                            >
+                                {showBikes ? 'Hide Bikes' : 'Show Bikes'}
+                            </button>
+                        </div>
+                    </div>
+
+                    {/* Toggle button for the controls column */}
+                    <button 
+                        onClick={() => setIsControlsVisible(!isControlsVisible)}
+                        className={`absolute top-1/2 -translate-y-1/2 h-16 w-8 z-[1002] rounded-r-lg bg-gray-900 bg-opacity-90 shadow-xl text-white flex items-center justify-center transition-all duration-300 ${isControlsVisible ? 'left-72' : 'left-0'}`}>
+                        {isControlsVisible ? '‹' : '›'}
+                    </button>
+
+                    {/* Alert Notification UI */}
+                    {isAlertActive && (
+                        <div className={`absolute bottom-4 left-1/2 -translate-x-1/2 z-[1001] p-4 rounded-xl shadow-xl transition-transform duration-300 transform scale-100 ${drowsinessAlert ? 'bg-red-600' : 'bg-yellow-400'} text-gray-900 max-w-sm w-full`}>
+                            <div className="flex justify-between items-center">
+                                <p className="font-semibold text-sm">{alertMessage}</p>
+                                <button onClick={handleAlertClose} className="text-gray-900 opacity-80 hover:opacity-100 font-bold ml-4">
+                                    &times;
+                                </button>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Drowsiness Detection Camera View */}
+                    {isDrowsinessDetectionEnabled && (
+                        <div className="absolute top-4 right-1/2 translate-x-1/2 z-[1001] w-48 h-36 bg-black rounded-lg shadow-lg overflow-hidden border border-gray-700">
+                            <video ref={videoRef} className="w-full h-full object-cover" autoPlay playsInline muted></video>
+                        </div>
+                    )}
+
+                    {/* Drowsiness Alert Overlay */}
+                    {drowsinessAlert && (
+                        <div className="absolute inset-0 z-[1000] bg-red-500 opacity-0 drowsiness-pulse"></div>
+                    )}
+            
+                    {/* Zoom Controls (Custom to avoid overlap) */}
+                    <div className="absolute bottom-4 right-4 z-[1001] flex flex-col space-y-2">
+                        <button
+                            onClick={() => handleZoom('+')}
+                            className="w-10 h-10 rounded-full bg-white shadow-md text-gray-800 text-2xl font-bold flex items-center justify-center hover:bg-gray-100 transition-colors"
+                        >
+                            +
+                        </button>
+                        <button
+                            onClick={() => handleZoom('-')}
+                            className="w-10 h-10 rounded-full bg-white shadow-md text-gray-800 text-2xl font-bold flex items-center justify-center hover:bg-gray-100 transition-colors"
+                        >
+                            -
+                        </button>
+                    </div>
+
+                    {/* Simulated Tesla-like UI Legend */}
+                    <div className="absolute top-4 right-4 z-[1001] p-4 bg-gray-800 text-white rounded-xl shadow-lg border border-gray-700">
+                        <h2 className="text-xl font-bold mb-4">Live View Legend</h2>
+                        <div className="space-y-2 text-sm">
+                            <div className="flex items-center space-x-2">
+                                <span className="w-4 h-4 rounded-full bg-green-400"></span>
+                                <span>Your Car</span>
+                            </div>
+                            <div className="flex items-center space-x-2">
+                                <span className="w-4 h-4 rounded-full bg-white border border-gray-400"></span>
+                                <span>Other Vehicles</span>
+                            </div>
+                            <div className="flex items-center space-x-2">
+                                <span className="text-xl">🚶‍♂️</span>
+                                <span>Pedestrians</span>
+                            </div>
+                             <div className="flex items-center space-x-2">
+                                <span className="text-xl">🚴‍♀️</span>
+                                <span>Cycles</span>
+                            </div>
+                            <div className="flex items-center space-x-2">
+                                <span className="text-xl">🐕</span>
+                                <span>Dogs</span>
+                            </div>
+                             <div className="flex items-center space-x-2">
+                                <span className="text-xl">🚚</span>
+                                <span>Heavy Vehicles</span>
+                            </div>
+                            <div className="flex items-center space-x-2">
+                                <span className="w-4 h-4 bg-yellow-400"></span>
+                                <span>Hazard Alert</span>
+                            </div>
+                            <div className="flex items-center space-x-2">
+                                <span className="w-4 h-4 bg-red-500"></span>
+                                <span>Drowsiness Alert</span>
+                            </div>
+                            <div className="flex items-center space-x-2">
+                                <div className="w-4 h-4 relative">
+                                    <span className="absolute inset-0 border-4 border-blue-400 rounded-full"></span>
+                                    <span className="absolute inset-2 border-4 border-blue-600 rounded-full"></span>
+                                </div>
+                                <span>Traffic Flow</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        // Render the App component into the root element.
+        ReactDOM.render(<App />, document.getElementById('root'));
+    </script>
+</body>
+</html>
